@@ -1,0 +1,153 @@
+#include <NTPClient.h>
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <WiFiManager.h>
+#include <DMDESP.h>
+#include <fonts/EMSans6x16.h>
+
+#define FontDefault EMSans6x16
+
+// DMDESP configuración
+#define DISPLAYS_WIDE 1
+#define DISPLAYS_HIGH 1
+DMDESP Disp(DISPLAYS_WIDE, DISPLAYS_HIGH);
+
+// Configuración de NTPClient
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "time.google.com", -3 * 3600, 60000);
+
+WiFiManager wifiManager;
+
+unsigned long lastUpdateMillis = 0;
+unsigned long localUpdateMillis = 0;
+unsigned long lastWiFiCheck = 0;
+const long updateDelay = 60000;        // Actualiza cada 60 segundos
+const long reconnectInterval = 30000;  // Intenta reconectar WiFi cada 30 segundos
+
+byte localHours = 12;     // Hora inicial por defecto
+byte localMinutes = 0;
+bool usingLocalTime = true;
+bool wifiRestored = false;
+
+//----------------------------------------------------------------------
+// SETUP
+
+void setup() {
+  Serial.begin(115200);
+
+  wifiManager.setConfigPortalTimeout(60); // 1 minuto para el portal
+
+  if (!wifiManager.autoConnect("RelojAP", "password")) {
+    Serial.println("No se pudo conectar a WiFi. Usando reloj local.");
+    usingLocalTime = true;
+  } else {
+    Serial.println("WiFi conectado exitosamente.");
+    usingLocalTime = false;
+  }
+
+  // Inicia NTPClient
+  timeClient.begin();
+
+  if (WiFi.status() == WL_CONNECTED && timeClient.update()) {
+    localHours = timeClient.getHours();
+    localMinutes = timeClient.getMinutes();
+    usingLocalTime = false;
+    Serial.println("Hora sincronizada desde NTP.");
+  } else {
+    Serial.println("No se pudo sincronizar con NTP. Usando reloj local.");
+    usingLocalTime = true;
+  }
+
+  // Configurar pantalla
+  Disp.start();
+  Disp.setBrightness(100);
+  Disp.setFont(FontDefault);
+  Disp.clear();
+  updateDisplay(); // Primera visualización
+}
+
+//----------------------------------------------------------------------
+// LOOP
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Reconexión WiFi cada 30 segundos sin bloquear
+  if (WiFi.status() != WL_CONNECTED && currentMillis - lastWiFiCheck >= 30000) {
+    lastWiFiCheck = currentMillis;
+    Serial.println("Intentando reconectar WiFi...");
+    WiFi.begin();
+  }
+
+  // Si WiFi vuelve a conectarse
+  if (WiFi.status() == WL_CONNECTED && wifiRestored) {
+    if (timeClient.update()) {
+      localHours = timeClient.getHours();
+      localMinutes = timeClient.getMinutes();
+      usingLocalTime = false;
+      wifiRestored = false;
+      Serial.println("WiFi reconectado y hora actualizada desde NTP.");
+    }
+  }
+
+  // Actualizar la hora cada minuto
+  if (currentMillis - lastUpdateMillis >= updateDelay) {
+    lastUpdateMillis = currentMillis;
+
+    // Intentar actualizar la hora desde NTP
+    if (WiFi.status() == WL_CONNECTED && timeClient.update()) {
+      localHours = timeClient.getHours();
+      localMinutes = timeClient.getMinutes();
+      usingLocalTime = false;
+      Serial.println("Actualizado desde NTP.");
+    } else {
+      // Incrementar reloj local
+      usingLocalTime = true;
+      localMinutes++;
+      if (localMinutes >= 60) {
+        localMinutes = 0;
+        localHours++;
+        if (localHours >= 24) {
+          localHours = 0;
+        }
+      }
+      Serial.println("Incrementando reloj local.");
+    }
+
+    // Actualizar pantalla solo aquí
+    updateDisplay();
+  }
+
+  Disp.loop(); // Actualiza constantemente la pantalla (necesario para DMDESP)
+}
+
+//----------------------------------------------------------------------
+// FUNCION PARA ACTUALIZAR LA PANTALLA SIN PARPADEOS
+
+void updateDisplay() {
+  static char lastDisplayedTime[6] = ""; // Guarda última hora mostrada
+  char currentTime[6];
+
+  // Formatea hora actual
+  sprintf(currentTime, "%02d %02d", localHours, localMinutes);
+
+  // Sólo actualiza si cambió la hora
+  if (strcmp(currentTime, lastDisplayedTime) != 0) {
+    Disp.clear(); // Limpia sólo cuando cambia la hora (evita parpadeos)
+
+    Disp.drawText(1, 0, currentTime);
+    Disp.drawLine(15, 6, 16, 6);
+    Disp.drawLine(15, 5, 16, 5);
+    Disp.drawLine(15, 10, 16, 10);
+    Disp.drawLine(15, 9, 16, 9);
+
+    // Actualiza buffer
+    strcpy(lastDisplayedTime, currentTime);
+  }
+
+  // Actualización efectiva del display una vez
+  Disp.loop();
+}
+
+//----------------------------------------------------------------------
+
