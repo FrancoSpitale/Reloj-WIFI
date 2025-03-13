@@ -3,126 +3,105 @@
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
 #include <DMDESP.h>
-#include <fonts/EMSans6x16.h>  // Fuente compacta utilizada
+#include <fonts/EMSans6x16.h>
 
-#define FontDefault EMSans6x16  // Configuración de la fuente predeterminada
+#define FontDefault EMSans6x16
 
-// Configuración del DMDESP
-#define DISPLAYS_WIDE 1 // Configurado para una sola pantalla
-#define DISPLAYS_HIGH 1 // Configurado para una sola pantalla
-DMDESP Disp(DISPLAYS_WIDE, DISPLAYS_HIGH);  // Configuración para una sola pantalla P10
+// DMDESP configuración
+#define DISPLAYS_WIDE 1
+#define DISPLAYS_HIGH 1
+DMDESP Disp(DISPLAYS_WIDE, DISPLAYS_HIGH);
 
 // Configuración de NTPClient
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "time.google.com", -3 * 3600, 60000); // UTC-3, actualiza cada 60 segundos
+NTPClient timeClient(ntpUDP, "time.google.com", -3 * 3600, 60000);
 
 WiFiManager wifiManager;
 
-unsigned long startupMillis; // Tiempo de inicio del circuito
-unsigned long lastUpdateMillis = 0; // Tiempo de la última actualización de pantalla
-unsigned long lastMinuteMillis = 0; // Tiempo de la última actualización del tiempo
-const long updateDelay = 1000; // Actualizar la pantalla cada 1 segundo
-const long minuteDelay = 60000; // Actualizar el tiempo cada 60 segundos
-const long configPortalDuration = 1 * 60 * 1000; // 1 minuto en milisegundos
+unsigned long lastUpdateMillis = 0;
+unsigned long localUpdateMillis = 0;
+unsigned long lastWiFiCheck = 0;
+const long updateDelay = 60000;        // Actualiza cada 60 segundos
+const long reconnectInterval = 30000;  // Intenta reconectar WiFi cada 30 segundos
 
-byte localHours = 0;
+byte localHours = 12;     // Hora inicial por defecto
 byte localMinutes = 0;
-bool usingLocalTime = false;
+bool usingLocalTime = true;
 bool wifiRestored = false;
 
-bool wifiConnecting = false;
-unsigned long wifiConnectStart = 0;
-
-// Variables para almacenar la hora mostrada previamente
-byte prevHours = 99;
-byte prevMinutes = 99;
-
-bool displayNeedsUpdate = true; // Indica si la pantalla necesita ser actualizada
-
 //----------------------------------------------------------------------
+// SETUP
+
 void setup() {
   Serial.begin(115200);
 
-  // Guardar el tiempo de inicio del circuito
-  startupMillis = millis();
+  wifiManager.setConfigPortalTimeout(60); // 1 minuto para el portal
 
-  // Iniciar el portal de configuración durante el primer minuto
-  wifiManager.setConfigPortalTimeout(configPortalDuration / 1000); // Tiempo de espera del portal de configuración en segundos
-  if (!wifiManager.startConfigPortal("RelojAP", "password")) {
-    Serial.println("No se pudo conectar a WiFi. Continuando en modo configuración.");
+  if (!wifiManager.autoConnect("RelojAP", "password")) {
+    Serial.println("No se pudo conectar a WiFi. Usando reloj local.");
+    usingLocalTime = true;
   } else {
-    Serial.println("Conectado a WiFi. Portal cerrado.");
+    Serial.println("WiFi conectado exitosamente.");
+    usingLocalTime = false;
   }
 
-  // Si pasado el tiempo no se ha conectado, intentar conectar a la red almacenada
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Intentando conectar a la red almacenada...");
-    WiFi.begin();
-    unsigned long connectStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - connectStart < 30000) { // Espera hasta 30 segundos
-      delay(500);
-      Serial.print(".");
-    }
+  // Inicia NTPClient
+  timeClient.begin();
 
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\nConectado a la red almacenada.");
-    } else {
-      Serial.println("\nNo se pudo conectar a la red almacenada. Manteniendo el portal de configuración abierto.");
-      wifiManager.startConfigPortal("RelojAP", "password"); // Volver al modo portal si no se puede conectar
-    }
+  if (WiFi.status() == WL_CONNECTED && timeClient.update()) {
+    localHours = timeClient.getHours();
+    localMinutes = timeClient.getMinutes();
+    usingLocalTime = false;
+    Serial.println("Hora sincronizada desde NTP.");
+  } else {
+    Serial.println("No se pudo sincronizar con NTP. Usando reloj local.");
+    usingLocalTime = true;
   }
 
-  // Iniciar el Cliente NTP
-  timeClient.begin();  
-
-  // Iniciar el DMDESP
-  Disp.start(); // Iniciar la biblioteca DMDESP
-  Disp.setBrightness(100); // Configurar el brillo
-  Disp.setFont(FontDefault); // Configurar la fuente predeterminada
-
-  // Limpiar la pantalla al inicio
-  Disp.clearScreen();
+  // Configurar pantalla
+  Disp.start();
+  Disp.setBrightness(100);
+  Disp.setFont(FontDefault);
+  Disp.clear();
+  updateDisplay(); // Primera visualización
 }
 
 //----------------------------------------------------------------------
+// LOOP
+
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Verificar estado de conexión WiFi y tratar de reconectar si no está conectado
-  if (WiFi.status() != WL_CONNECTED && !wifiConnecting) {
-    Serial.println("WiFi desconectado. Intentando reconectar...");
+  // Reconexión WiFi cada 30 segundos sin bloquear
+  if (WiFi.status() != WL_CONNECTED && currentMillis - lastWiFiCheck >= 30000) {
+    lastWiFiCheck = currentMillis;
+    Serial.println("Intentando reconectar WiFi...");
     WiFi.begin();
-    wifiConnecting = true;
-    wifiConnectStart = millis();
   }
 
-  // Si estamos intentando reconectar
-  if (wifiConnecting) {
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("WiFi reconectado.");
-      wifiRestored = true; // Marcar que se ha restablecido la conexión
-      wifiConnecting = false;
-    } else if (millis() - wifiConnectStart > 30000) {
-      Serial.println("No se pudo reconectar a WiFi.");
-      wifiConnecting = false;
+  // Si WiFi vuelve a conectarse
+  if (WiFi.status() == WL_CONNECTED && wifiRestored) {
+    if (timeClient.update()) {
+      localHours = timeClient.getHours();
+      localMinutes = timeClient.getMinutes();
+      usingLocalTime = false;
+      wifiRestored = false;
+      Serial.println("WiFi reconectado y hora actualizada desde NTP.");
     }
   }
 
-  // Actualizar el tiempo cada minuto
-  if (currentMillis - lastMinuteMillis >= minuteDelay) {
-    lastMinuteMillis = currentMillis;
+  // Actualizar la hora cada minuto
+  if (currentMillis - lastUpdateMillis >= updateDelay) {
+    lastUpdateMillis = currentMillis;
 
-    // Si tenemos conexión y podemos actualizar desde NTP
+    // Intentar actualizar la hora desde NTP
     if (WiFi.status() == WL_CONNECTED && timeClient.update()) {
-      usingLocalTime = false;
-      wifiRestored = false; // Ya no es necesario marcar que la WiFi ha sido restaurada
-
-      // Obtener la hora y los minutos actuales desde el servidor NTP
       localHours = timeClient.getHours();
       localMinutes = timeClient.getMinutes();
-      
+      usingLocalTime = false;
       Serial.println("Actualizado desde NTP.");
     } else {
+      // Incrementar reloj local
       usingLocalTime = true;
       localMinutes++;
       if (localMinutes >= 60) {
@@ -135,48 +114,41 @@ void loop() {
       Serial.println("Incrementando reloj local.");
     }
 
-    // Indicar que la pantalla necesita ser actualizada
-    displayNeedsUpdate = true;
+    // Actualizar pantalla solo aquí
+    updateDisplay();
   }
 
-  // Actualizar la pantalla cada segundo
-  if (currentMillis - lastUpdateMillis >= updateDelay) {
-    lastUpdateMillis = currentMillis;  // Registrar el tiempo de la última actualización
-
-    // Alternar el estado de los dos puntos para crear un efecto de parpadeo
-    static bool colonState = false;
-    colonState = !colonState;
-
-    // Siempre actualizar los segundos para mantener los dos puntos parpadeando
-    displayNeedsUpdate = true;
-  }
-
-  // Si la pantalla necesita ser actualizada
-  if (displayNeedsUpdate) {
-    displayNeedsUpdate = false;
-
-    // Formatear la hora en el formato "HH MM"
-    char jam[6];
-    sprintf(jam, "%02d %02d", localHours, localMinutes);  // Separar la hora y los minutos con un espacio
-
-    // Mostrar la hora en la pantalla
-    Disp.clearScreen(); // Limpiar la pantalla
-
-    // Dibujar la hora
-    Disp.drawText(1, 0, jam);
-
-    // Dibujar los dos puntos parpadeantes
-    static bool colonState = false;
-    colonState = !colonState;
-    if (colonState) {
-      // Dibujar los puntos
-      Disp.drawLine(15, 6, 16, 6);  // Punto superior
-      Disp.drawLine(15, 5, 16, 5);  // Punto superior
-      Disp.drawLine(15, 10, 16, 10);  // Punto inferior
-      Disp.drawLine(15, 9, 16, 9);
-    }
-
-    // Actualizar la pantalla
-    Disp.scanDisplayBySPI();
-  }
+  Disp.loop(); // Actualiza constantemente la pantalla (necesario para DMDESP)
 }
+
+//----------------------------------------------------------------------
+// FUNCION PARA ACTUALIZAR LA PANTALLA SIN PARPADEOS
+
+void updateDisplay() {
+  static char lastDisplayedTime[6] = ""; // Guarda última hora mostrada
+  char currentTime[6];
+
+  // Formatea hora actual
+  sprintf(currentTime, "%02d %02d", localHours, localMinutes);
+
+  // Sólo actualiza si cambió la hora
+  if (strcmp(currentTime, lastDisplayedTime) != 0) {
+    Disp.clear(); // Limpia sólo cuando cambia la hora (evita parpadeos)
+
+    Disp.drawText(1, 0, currentTime);
+    Disp.drawLine(15, 6, 16, 6);
+    Disp.drawLine(15, 5, 16, 5);
+    Disp.drawLine(15, 10, 16, 10);
+    Disp.drawLine(15, 9, 16, 9);
+
+    // Actualiza buffer
+    strcpy(lastDisplayedTime, currentTime);
+  }
+
+  // Actualización efectiva del display una vez
+  Disp.loop();
+}
+
+//----------------------------------------------------------------------
+
+
